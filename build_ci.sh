@@ -13,10 +13,32 @@ set -e
 
 SDK_ROOT=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}
 BT_VER=${BUILD_TOOLS_VERSION:-34.0.0}
+
+# build-tools 版本兜底（runner 上可能只有别的版本）
+if [ ! -d "$SDK_ROOT/build-tools/$BT_VER" ]; then
+  ALT=$(ls -d "$SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -1)
+  [ -n "$ALT" ] && BT_VER=$(basename "$ALT")
+fi
 BT=$SDK_ROOT/build-tools/$BT_VER
+
+# platforms 兜底
 PLATFORM=${COMPILE_SDK:-android-34}
+if [ ! -f "$SDK_ROOT/platforms/$PLATFORM/android.jar" ]; then
+  ALT=$(ls -d "$SDK_ROOT"/platforms/* 2>/dev/null | sort -V | tail -1)
+  [ -n "$ALT" ] && PLATFORM=$(basename "$ALT")
+fi
 ANDROID_JAR=$SDK_ROOT/platforms/$PLATFORM/android.jar
-NDK=${NDK_PATH:-${ANDROID_NDK_HOME:-$SDK_ROOT/ndk/25.2.9519653}}
+
+# NDK 兜底
+NDK=${NDK_PATH:-${ANDROID_NDK_HOME:-}}
+if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+  NDK=$(ls -d "$SDK_ROOT"/ndk/* 2>/dev/null | head -1)
+fi
+
+echo "SDK_ROOT=$SDK_ROOT"
+echo "BUILD_TOOLS=$BT_VER"
+echo "PLATFORM=$PLATFORM"
+echo "NDK=$NDK"
 
 LXAPI=${LXAPI_JAR:-libs/api-102.jar}
 SRC=app/src/main/java

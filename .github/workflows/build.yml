@@ -24,38 +24,62 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # GitHub ubuntu-latest runner 预装了 Android SDK（含 build-tools / platforms）
+      # 不用 android-actions/setup-android（它有 sdkmanager 'tools' 包名过期的坑）
+      - name: Locate Android SDK
+        run: |
+          SDK=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}
+          echo "SDK=$SDK"
+          ls "$SDK" || true
+          echo "--- build-tools ---"
+          ls "$SDK/build-tools" || true
+          echo "--- platforms ---"
+          ls "$SDK/platforms" || true
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
 
-      - name: Setup NDK
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r25c
-          add-to-path: false
+      - name: Install required SDK components
+        run: |
+          SDK="$ANDROID_SDK_ROOT"
+          SM=$(find "$SDK/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)
+          echo "sdkmanager: $SM"
+          if [ -n "$SM" ]; then
+            yes | "$SM" --licenses > /dev/null 2>&1 || true
+            "$SM" "platforms;android-34" "build-tools;34.0.0" "ndk;25.2.9519653" > /dev/null 2>&1 || true
+          fi
+          echo "--- after ---"
+          ls "$SDK/build-tools" || true
+          ls "$SDK/ndk" || true
+
+      - name: Setup NDK path
+        run: |
+          SDK="$ANDROID_SDK_ROOT"
+          N=$(ls -d "$SDK"/ndk/* 2>/dev/null | head -1)
+          if [ -z "$N" ]; then
+            # 没有就下一个
+            N="$SDK/ndk/android-ndk-r25c"
+            mkdir -p "$SDK/ndk"
+            curl -sL --retry 3 -o /tmp/ndk.zip \
+              "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
+            unzip -q /tmp/ndk.zip -d "$SDK/ndk"
+            N="$SDK/ndk/android-ndk-r25c"
+          fi
+          echo "NDK_PATH=$N" >> "$GITHUB_ENV"
+          echo "NDK=$N"
+          ls "$N" | head -5
 
       - name: Download libxposed API 102
         run: |
           mkdir -p libs
-          curl -sL --retry 3 \
-            -o api.aar \
+          curl -sL --retry 3 -o api.aar \
             "https://repo1.maven.org/maven2/io/github/libxposed/api/102.0.0/api-102.0.0.aar"
           unzip -o -q api.aar classes.jar -d tmpapi
           mv tmpapi/classes.jar libs/api-102.jar
           ls -la libs/
 
-      - name: Build native library
-        env:
-          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Build
         run: |
           chmod +x build_ci.sh
-          ./build_ci.sh native
-
-      - name: Build APK
-        env:
-          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: |
-          ./build_ci.sh apk
+          ./build_ci.sh all
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
