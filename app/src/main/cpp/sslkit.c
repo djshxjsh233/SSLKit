@@ -263,6 +263,7 @@ static int g_inline_enabled = 0;
 
 /* 前向声明 */
 static uint32_t gnu_hash_symcount(uint64_t gnu_hash, uint64_t symtab);
+static void *create_trampoline(void *target, const unsigned char *saved);
 static int collect_symbols_in_so(const char *soname, uintptr_t base,
                                  const void *dyn, size_t dyn_size);
 static int inline_hook_collected(void);
@@ -540,8 +541,9 @@ typedef struct {
     void *replacement;
     unsigned char saved[16];
     int installed;
-    int patched;      /* 是否已 patch 到 stub */
-    unsigned char *stub; /* 跳板：保存原指令 + 跳回 */
+    /* ★ 跳板（trampoline）：保存被覆盖的原始指令 + 跳回 target+16，
+     *   供"调用原函数"使用。绝不能直接调 target（已被改写 -> 无限递归）。 */
+    void *trampoline;
 } inline_hook_t;
 
 static inline_hook_t g_inline[16];
@@ -860,6 +862,9 @@ static int inline_hook_collected(void) {
         for (int h = 0; h < g_hook_count; h++) {
             if (strcmp(hit->name, g_hooks[h].name) != 0) continue;
 
+            /* ★ 已被 GOT hook 过的符号跳过 inline（避免 original 指向被改写代码） */
+            if (g_hooks[h].hooked) break;
+
             int dup = 0;
             for (int k = 0; k < g_inline_count; k++) {
                 if (g_inline[k].target == (void *) hit->sym_addr) {
@@ -870,14 +875,20 @@ static int inline_hook_collected(void) {
             if (dup) break;
             if (g_inline_count >= 16) break;
 
-            if (g_hooks[h].original == NULL) {
-                g_hooks[h].original = (void *) hit->sym_addr;
-            }
-
             inline_hook_t *ih = &g_inline[g_inline_count];
             ih->target = (void *) hit->sym_addr;
             ih->replacement = g_hooks[h].replacement;
             memcpy(ih->saved, ih->target, 16);
+
+            /* ★ 先建跳板：original 必须指向跳板，不能指向被改写的 target
+             *   （否则 orig() 会再次跳进我们的 hook -> 无限递归 -> 卡死） */
+            ih->trampoline = create_trampoline(ih->target, ih->saved);
+            if (ih->trampoline == NULL) {
+                LOGE("trampoline failed for %s -> skip", hit->name);
+                break;
+            }
+            g_hooks[h].original = ih->trampoline;
+
             if (write_abs_jump(ih->target, g_hooks[h].replacement) == 0) {
                 ih->installed = 1;
                 g_inline_count++;
@@ -891,6 +902,32 @@ static int inline_hook_collected(void) {
         }
     }
     return hooked;
+}
+
+/*
+ * 创建跳板（trampoline）：
+ *   在别处分配可执行内存，放入【被覆盖的原始指令】+【跳回 target+16 的绝对跳转】。
+ *   这样"调用原函数"不会再次进入我们自己的 hook（避免无限递归 -> 网络卡死）。
+ */
+static void *create_trampoline(void *target, const unsigned char *saved) {
+    long page = sysconf(_SC_PAGESIZE);
+    void *mem = mmap(NULL, (size_t) page, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        LOGE("trampoline mmap failed (errno=%d)", errno);
+        return NULL;
+    }
+    unsigned char *p = (unsigned char *) mem;
+    memcpy(p, saved, 16);
+    uint64_t back = (uint64_t) ((uintptr_t) target + 16);
+    p[16] = 0x50; p[17] = 0x00; p[18] = 0x00; p[19] = 0x58;
+    p[20] = 0x00; p[21] = 0x02; p[22] = 0x1F; p[23] = 0xD6;
+    for (int i = 0; i < 8; i++) {
+        p[24 + i] = (unsigned char) ((back >> (i * 8)) & 0xff);
+    }
+    __builtin___clear_cache((char *) mem, (char *) mem + 32);
+    LOGI("trampoline created: %p for target=%p", mem, target);
+    return mem;
 }
 
 int hook_so_by_dynamic(so_ctx_t *ctx) {
