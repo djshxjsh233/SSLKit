@@ -577,11 +577,28 @@ static int write_abs_jump(void *target, void *dest) {
         code[8 + i] = (unsigned char)((d >> (i * 8)) & 0xff);
     }
 
-    /* ★ 顺序：先写数据块 [8..15]，再写指令块 [0..7]（原子 8 字节） */
-    __atomic_store_n((uint64_t *) ((uintptr_t) target + 8),
-                     *(uint64_t *) (code + 8), __ATOMIC_RELEASE);
-    __atomic_store_n((uint64_t *) (uintptr_t) target,
-                     *(uint64_t *) code, __ATOMIC_RELEASE);
+    /*
+     * ★ 写入策略（修正 BUS_ADRALN）：
+     *   目标函数地址可能只 4 字节对齐（实测 libsscronet.so+0x27a30c），
+     *   用 __atomic_store_n(uint64_t*) 会因 8 字节对齐要求触发
+     *   SIGBUS / BUS_ADRALN。
+     *
+     *   aarch64 上「4 字节对齐的 4 字节 store」本身就是原子的，
+     *   所以拆成 4 次 4 字节写：
+     *     1) 先写数据 [8..15]（dest 地址，两半）
+     *     2) 再写指令 [4..7]（br x16）
+     *     3) 最后写 [0..3]（ldr x16,#8）—— 这一步落地后跳转才生效
+     *   保证任何时刻 CPU 取到的要么是原指令，要么是完整跳转。
+     */
+    volatile uint32_t *dst = (volatile uint32_t *) target;
+    volatile uint32_t *src = (volatile uint32_t *) code;
+    __asm__ __volatile__("dmb ish" ::: "memory");
+    dst[2] = src[2];     /* .quad dest 低 4 字节 */
+    dst[3] = src[3];     /* .quad dest 高 4 字节 */
+    dst[1] = src[1];     /* br x16 */
+    __asm__ __volatile__("dmb ish" ::: "memory");
+    dst[0] = src[0];     /* ldr x16,#8 —— 生效点 */
+    __asm__ __volatile__("dmb ish" ::: "memory");
 
     __builtin___clear_cache((char *) target, (char *) target + 16);
     mprotect((void *) pg, len, PROT_READ | PROT_EXEC);
