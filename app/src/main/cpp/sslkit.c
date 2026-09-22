@@ -624,6 +624,7 @@ static int collect_symbols_in_so(const char *soname, uintptr_t base,
     if (!d) return 0;
 
     uint64_t symtab = 0, strtab = 0, strsz = 0;
+    uint64_t hash = 0, gnu_hash = 0;
     int cnt = (int) (dyn_size / 16);
     for (int i = 0; i < cnt; i++) {
         uint64_t tag = d[i * 2], val = d[i * 2 + 1];
@@ -631,25 +632,48 @@ static int collect_symbols_in_so(const char *soname, uintptr_t base,
         if (tag == DT_SYMTAB_) symtab = val;
         else if (tag == DT_STRTAB_) strtab = val;
         else if (tag == DT_STRSZ_) strsz = val;
+        else if (tag == DT_HASH_) hash = val;
+        else if (tag == DT_GNU_HASH_) gnu_hash = val;
     }
     if (!symtab || !strtab) return 0;
+
+    /* ★ 地址归一：d_val 可能是"相对基址偏移"，也可能是"已重定位的绝对地址" */
     if (symtab < base) symtab += base;
     if (strtab < base) strtab += base;
+    if (hash && hash < base) hash += base;
+    if (gnu_hash && gnu_hash < base) gnu_hash += base;
+
+    /* ★ 用 DT_HASH 的 nchain 精确界定符号数量（最可靠） */
+    uint32_t nsym_limit = 40000;
+    if (hash) {
+        uint32_t nchain = *(uint32_t *) (hash + 4);   /* hash[1] = nchain */
+        if (nchain > 0 && nchain < 200000) {
+            nsym_limit = nchain;
+        }
+    } else if (gnu_hash && strsz) {
+        /* GNU hash 没直接给 nchain，用保守上限 */
+        nsym_limit = 40000;
+    }
+    LOGI("  [dynsym] %s: symtab=%p strtab=%p strsz=%lu hash=%p limit=%u",
+         soname ? soname : "?", (void *) symtab, (void *) strtab,
+         (unsigned long) strsz, (void *) hash, nsym_limit);
 
     int found = 0;
-    for (int k = 0; k < 40000; k++) {
+    /* 先把 strtab 边界算出来，防止越界读 */
+    uint64_t str_lo = strtab;
+    uint64_t str_hi = strsz ? (strtab + strsz) : (strtab + 0x100000);
+
+    for (uint32_t k = 0; k < nsym_limit; k++) {
         uint8_t *sym = (uint8_t *) (symtab + (uint64_t) k * 24);
         uint32_t st_name = *(uint32_t *) (sym);
         uint16_t st_shndx = *(uint16_t *) (sym + 6);
         uint64_t st_value = *(uint64_t *) (sym + 8);
         uint64_t st_size = *(uint64_t *) (sym + 16);
 
-        if (st_name == 0 && st_value == 0 && st_shndx == 0) {
-            if (k > 0) break;
-            continue;
-        }
         if (st_name == 0) continue;
-        if (strsz && (uint64_t) st_name >= strsz) continue;
+        uint64_t name_addr = strtab + st_name;
+        if (name_addr < str_lo || name_addr >= str_hi) continue;
+        if (st_shndx == 0 || st_value == 0) continue;
         const char *nm = (const char *) (strtab + st_name);
         if (!nm || !*nm) continue;
 
