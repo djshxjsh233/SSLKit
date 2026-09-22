@@ -264,6 +264,7 @@ static int g_inline_enabled = 0;
 /* 前向声明 */
 static uint32_t gnu_hash_symcount(uint64_t gnu_hash, uint64_t symtab);
 static void *create_trampoline(void *target, const unsigned char *saved);
+static void *make_nearby_stub(void *target, void *dest);
 static int collect_symbols_in_so(const char *soname, uintptr_t base,
                                  const void *dyn, size_t dyn_size);
 static int inline_hook_collected(void);
@@ -583,39 +584,57 @@ static int write_abs_jump(void *target, void *dest) {
         return -1;
     }
 
-    /* 构造 16 字节跳转块 */
-    unsigned char code[16];
-    code[0] = 0x50; code[1] = 0x00; code[2] = 0x00; code[3] = 0x58;  /* ldr x16,#8 */
-    code[4] = 0x00; code[5] = 0x02; code[6] = 0x1F; code[7] = 0xD6;  /* br x16 */
-    uint64_t d = (uint64_t) dest;
-    for (int i = 0; i < 8; i++) {
-        code[8 + i] = (unsigned char)((d >> (i * 8)) & 0xff);
-    }
-
     /*
-     * ★ 写入策略（修正 BUS_ADRALN）：
-     *   目标函数地址可能只 4 字节对齐（实测 libsscronet.so+0x27a30c），
-     *   用 __atomic_store_n(uint64_t*) 会因 8 字节对齐要求触发
-     *   SIGBUS / BUS_ADRALN。
+     * ★ 只用 4 字节指令（b +-128MB）跳到一个 nearby stub，
+     *   stub 里再放完整的 16 字节绝对跳转。
      *
-     *   aarch64 上「4 字节对齐的 4 字节 store」本身就是原子的，
-     *   所以拆成 4 次 4 字节写：
-     *     1) 先写数据 [8..15]（dest 地址，两半）
-     *     2) 再写指令 [4..7]（br x16）
-     *     3) 最后写 [0..3]（ldr x16,#8）—— 这一步落地后跳转才生效
-     *   保证任何时刻 CPU 取到的要么是原指令，要么是完整跳转。
+     * 原因（静态自检发现）：libttboringssl.so 里
+     *   SSL_CTX_set_custom_verify (0x49dac, 12B) -> 下一个函数在 0x49db8
+     *   SSL_CTX_set_verify        (0x50810, 12B) -> 下一个函数在 0x5081c
+     * 相邻函数间隙只有 12 字节，写 16 字节会破坏下一个函数。
      */
-    volatile uint32_t *dst = (volatile uint32_t *) target;
-    volatile uint32_t *src = (volatile uint32_t *) code;
-    __asm__ __volatile__("dmb ish" ::: "memory");
-    dst[2] = src[2];     /* .quad dest 低 4 字节 */
-    dst[3] = src[3];     /* .quad dest 高 4 字节 */
-    dst[1] = src[1];     /* br x16 */
-    __asm__ __volatile__("dmb ish" ::: "memory");
-    dst[0] = src[0];     /* ldr x16,#8 —— 生效点 */
-    __asm__ __volatile__("dmb ish" ::: "memory");
+    void *stub = make_nearby_stub(target, dest);
+    if (stub == NULL) {
+        LOGE("nearby stub alloc failed for target=%p", target);
+        mprotect((void *) pg, len, PROT_READ | PROT_EXEC);
+        return -1;
+    }
+    /*
+     * ★ b 指令的 imm26 只能表达【4 字节对齐】的偏移（imm26 << 2）。
+     *   所以必须强制对齐校验，否则编码会丢失低 2 位 -> 跳到错误地址。
+     *   （静态自检 + 离线断言脚本双重验证，见 tools/verify_branch.py）
+     */
+    uintptr_t pc_next = (uintptr_t) target + 4;
+    if (pc_next & 3u) {
+        LOGE("b 指令要求 4 字节对齐: pc_next=%p", (void *) pc_next);
+        mprotect((void *) pg, len, PROT_READ | PROT_EXEC);
+        return -1;
+    }
+    long delta = (long) ((uintptr_t) stub - pc_next);
+    if (delta & 3L) {
+        LOGE("b 偏移非 4 字节对齐: delta=%ld", delta);
+        mprotect((void *) pg, len, PROT_READ | PROT_EXEC);
+        return -1;
+    }
+    if (delta > 0x7FFFFFC || delta < -0x8000000) {
+        LOGE("stub too far for b: delta=%ld", delta);
+        mprotect((void *) pg, len, PROT_READ | PROT_EXEC);
+        return -1;
+    }
+    uint32_t b_insn = 0x14000000u | ((uint32_t) ((delta >> 2) & 0x03FFFFFFu));
+    unsigned char code[4];
+    code[0] = (unsigned char) (b_insn & 0xff);
+    code[1] = (unsigned char) ((b_insn >> 8) & 0xff);
+    code[2] = (unsigned char) ((b_insn >> 16) & 0xff);
+    code[3] = (unsigned char) ((b_insn >> 24) & 0xff);
 
-    __builtin___clear_cache((char *) target, (char *) target + 16);
+    /* 只写 1 条 4 字节 b 指令；4 字节对齐的 4 字节 store 在 aarch64 上是原子的 */
+    volatile uint32_t *dst = (volatile uint32_t *) target;
+    __asm__ __volatile__("dmb ish" ::: "memory");
+    *dst = b_insn;
+    __asm__ __volatile__("dmb ish" ::: "memory");
+    __builtin___clear_cache((char *) target, (char *) target + 4);
+
     mprotect((void *) pg, len, PROT_READ | PROT_EXEC);
     return 0;
 }
@@ -652,19 +671,29 @@ static int try_inline_hook_global(void) {
         if (g_inline_count >= 16) {
             break;
         }
+        /* ★ 已被其它路径 hook 过就跳过（避免 original 互相覆盖 / 二次改写） */
+        if (g_hooks[i].hooked) {
+            continue;
+        }
         inline_hook_t *h = &g_inline[g_inline_count];
         h->target = addr;
         h->replacement = g_hooks[i].replacement;
         memcpy(h->saved, addr, 16);
+        /* ★ 先建跳板，original 必须指向跳板而不是被改写的 addr */
+        h->trampoline = create_trampoline(addr, h->saved);
+        if (h->trampoline == NULL) {
+            LOGE("trampoline failed (global) for %s -> skip", g_hooks[i].name);
+            continue;
+        }
+        g_hooks[i].original = h->trampoline;
         if (write_abs_jump(addr, g_hooks[i].replacement) == 0) {
             h->installed = 1;
             g_inline_count++;
             hooked++;
-            if (g_hooks[i].original == NULL) {
-                g_hooks[i].original = addr;
-            }
             g_hooks[i].hooked = 1;
             LOGI("inline-hooked (global): %s @ %p", g_hooks[i].name, addr);
+        } else {
+            g_hooks[i].original = NULL;   /* 失败则回退，避免指向无效跳板 */
         }
     }
     return hooked;
@@ -902,6 +931,40 @@ static int inline_hook_collected(void) {
         }
     }
     return hooked;
+}
+
+
+/* 在 target 附近（+-100MB 内）分配一个 stub 页，写入完整 16 字节绝对跳转 */
+static void *make_nearby_stub(void *target, void *dest) {
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t t = (uintptr_t) target & ~(uintptr_t) (page - 1);
+    /* 从 target 前后各尝试 mmap（不带 MAP_FIXED，让内核选；用 hint） */
+    for (int i = 1; i <= 64; i++) {
+        uintptr_t hint = (i % 2) ? (t + (uintptr_t) i * (uintptr_t) page * 16)
+                                 : (t - (uintptr_t) i * (uintptr_t) page * 16);
+        void *m = mmap((void *) hint, (size_t) page,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) {
+            continue;
+        }
+        long delta = (long) ((uintptr_t) m - ((uintptr_t) target + 4));
+        if (delta > 0x7FFFFFC || delta < -0x8000000) {
+            munmap(m, (size_t) page);
+            continue;
+        }
+        /* 写入 16 字节绝对跳转 */
+        unsigned char *p = (unsigned char *) m;
+        p[0] = 0x50; p[1] = 0x00; p[2] = 0x00; p[3] = 0x58;  /* ldr x16,#8 */
+        p[4] = 0x00; p[5] = 0x02; p[6] = 0x1F; p[7] = 0xD6;  /* br x16 */
+        uint64_t d = (uint64_t) dest;
+        for (int k = 0; k < 8; k++) {
+            p[8 + k] = (unsigned char) ((d >> (k * 8)) & 0xff);
+        }
+        __builtin___clear_cache((char *) m, (char *) m + 16);
+        return m;
+    }
+    return NULL;
 }
 
 /*
