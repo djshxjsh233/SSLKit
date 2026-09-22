@@ -1,0 +1,74 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25c
+          add-to-path: false
+
+      - name: Download libxposed API 102
+        run: |
+          mkdir -p libs
+          curl -sL --retry 3 \
+            -o api.aar \
+            "https://repo1.maven.org/maven2/io/github/libxposed/api/102.0.0/api-102.0.0.aar"
+          unzip -o -q api.aar classes.jar -d tmpapi
+          mv tmpapi/classes.jar libs/api-102.jar
+          ls -la libs/
+
+      - name: Build native library
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          chmod +x build_ci.sh
+          ./build_ci.sh native
+
+      - name: Build APK
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ./build_ci.sh apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSLKit-apk
+          path: out/SSLKit.apk
+          if-no-files-found: error
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/SSLKit.apk
+          generate_release_notes: true
+          draft: false
+          prerelease: false

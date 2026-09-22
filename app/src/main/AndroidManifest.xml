@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.sslkit">
+
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="37" />
+
+    <application
+        android:label="SSLKit"
+        android:allowBackup="false"
+        android:supportsRtl="true">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:label="SSLKit">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription"
+            android:value="SSLKit — 通用 SSL Pinning 绕过（Java / Native / Cronet / Flutter / WebView / 反检测）" />
+        <meta-data android:name="xposedminversion" android:value="102" />
+    </application>
+</manifest>

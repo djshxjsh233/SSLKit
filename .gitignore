@@ -1,0 +1,27 @@
+# Build
+build/
+out/
+*.apk
+*.dex
+*.so
+!app/src/main/jniLibs/**/*.so
+
+# IDE
+.idea/
+*.iml
+.gradle/
+local.properties
+
+# Keystore
+*.jks
+*.keystore
+!ci.keystore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+api.aar
+tmpapi/
+libs/api-*.jar
