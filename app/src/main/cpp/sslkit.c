@@ -259,7 +259,7 @@ static bool sslkit_Cronet_EngineParams_public_key_pins_add(void *params, void *p
 
 /* ★ 全局开关：inline hook 在部分设备/App 上会因 SELinux 拒绝 mprotect(RWX)
  * 触发 SIGSEGV(SEGV_ACCERR)，默认关闭，由 system property debug.sslkit.inline=1 开启 */
-static int g_inline_enabled = 0;
+static int g_inline_enabled = 0;   /* 受 system property 控制，默认关 */
 
 /* 前向声明 */
 static uint32_t gnu_hash_symcount(uint64_t gnu_hash, uint64_t symtab);
@@ -358,6 +358,31 @@ static int is_tls_so(const char *name) {
     if (!name) return 0;
     for (int i = 0; g_tls_so_whitelist[i]; i++) {
         if (strcasestr(name, g_tls_so_whitelist[i])) return 1;
+    }
+    return 0;
+}
+
+/*
+ * ★★★ 禁止 inline hook 的 so（有自校验，改代码段 = SIGTRAP 崩）
+ *
+ * 实测：libsscronet.so 含 2568 条 brk #0 指令 + integrity/checksum/CRC 字符串，
+ *       /proc/self/maps 自检 + 反 frida。
+ *       inline hook 改它代码段 -> ChromiumNet0 线程 Fatal signal 5
+ *       (SIGTRAP/TRAP_BRKPT) -> App 崩。
+ *
+ * 对这类库只能走 GOT hook（改数据段，不改代码）。
+ */
+static const char *g_no_inline_so[] = {
+    "libsscronet", "libmetasec", "libmannorarmor", "libgodzilla",
+    "libnslinker", "libEncryptor", "libprobe", "libmsaoaidsec",
+    "libsecurity", "libreweigh", "libmysolloader",
+    NULL
+};
+
+static int is_no_inline_so(const char *name) {
+    if (!name) return 0;
+    for (int i = 0; g_no_inline_so[i]; i++) {
+        if (strcasestr(name, g_no_inline_so[i])) return 1;
     }
     return 0;
 }
@@ -546,9 +571,11 @@ static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
 
         /* 方式 B：★ 收集符号实体（只对 TLS 白名单 so 做 —— 全扫风险高） */
         int m = 0;
-        if (is_tls_so(name)) {
+        if (is_tls_so(name) && !is_no_inline_so(name)) {
             m = collect_symbols_in_so(name, info->dlpi_addr,
                                       (const void *) dyn_addr, (size_t) ph->p_memsz);
+        } else if (is_no_inline_so(name)) {
+            LOGI("★ skip inline-hook (self-integrity checked): %s", name);
         }
         /* 非白名单 so：只打一次日志说明跳过 */
         else {
@@ -1303,18 +1330,33 @@ static void sslkit_ctor(void) {
         g_inline_enabled = 1;
     }
     LOGI("libsslkit.so loaded, inline_hook=%s", g_inline_enabled ? "ON" : "OFF");
+
+    /* ★ 分阶段：
+     *   stage 1（默认）：只装 GOT hook —— 不碰代码段，零闪退风险
+     *   stage 2（inline=1）：额外做符号实体 inline hook
+     *   stage 3（watchdog=1）：再开轮询线程
+     */
     register_hooks();
+
+    /* GOT hook：安全，总是执行 */
     dl_iterate_phdr(phdr_cb, NULL);
-    inline_hook_collected();
-    try_inline_hook_global();
+    LOGI("stage1 done: GOT hook installed");
 
-    /* ★ 拦截 dlopen，新 so 加载后立刻 hook */
-    install_dlopen_hooks();
+    /* inline hook：只在那之后，且需要显式开启 */
+    if (g_inline_enabled) {
+        inline_hook_collected();
+        try_inline_hook_global();
+        LOGI("stage2 done: inline hook");
+    }
 
-    /* ★ watchdog 线程兜底（dlopen 拦截可能被 linker 内部路径绕过） */
-    pthread_t t;
-    if (pthread_create(&t, NULL, watchdog_thread, NULL) == 0) {
-        pthread_detach(t);
-        LOGI("[watchdog] started (300 x 200ms)");
+    /* watchdog：独立开关，避免早期线程影响 App 启动 */
+    char wbuf[8];
+    wbuf[0] = 0;
+    if (__system_property_get("debug.sslkit.watchdog", wbuf) > 0 && wbuf[0] == '1') {
+        pthread_t t;
+        if (pthread_create(&t, NULL, watchdog_thread, NULL) == 0) {
+            pthread_detach(t);
+            LOGI("[watchdog] started");
+        }
     }
 }
