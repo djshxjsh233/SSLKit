@@ -254,6 +254,13 @@ static bool sslkit_Cronet_EngineParams_public_key_pins_add(void *params, void *p
  *  符号表
  * ==================================================================== */
 
+/* 前向声明 */
+static int collect_symbols_in_so(const char *soname, uintptr_t base,
+                                 const void *dyn, size_t dyn_size);
+static int inline_hook_collected(void);
+static int write_abs_jump(void *target, void *dest);
+static int try_inline_hook_global(void);
+
 static void register_hooks(void) {
     int i = 0;
     g_hooks[i].name = "SSL_CTX_set_custom_verify";
@@ -460,11 +467,16 @@ static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
         ctx.dyn_size = ph->p_memsz;
         ctx.hooked_count = 0;
 
-        /* 用动态段方式 hook */
+        /* 方式 A：GOT hook */
         extern int hook_so_by_dynamic(so_ctx_t *ctx);
         int n = hook_so_by_dynamic(&ctx);
-        if (n > 0) {
-            LOGI("%s: hooked %d entries", name, n);
+
+        /* 方式 B：★ 收集该 so 里目标符号的实体地址（供 inline hook） */
+        int m = collect_symbols_in_so(name, info->dlpi_addr,
+                                      (const void *) dyn_addr, (size_t) ph->p_memsz);
+
+        if (n > 0 || m > 0) {
+            LOGI("%s: GOT=%d, SYM=%d", name, n, m);
         }
         break;
     }
@@ -483,6 +495,9 @@ static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
 int hook_so_by_dynamic(so_ctx_t *ctx);
 int hook_rela_entries(void *rela_addr, size_t n, uint64_t symtab, uint64_t strtab,
                       uint64_t base, so_ctx_t *ctx);
+static int collect_symbols_in_so(const char *soname, uintptr_t base,
+                                 const void *dyn, size_t dyn_size);
+static int inline_hook_collected(void);
 
 /*
  * ★ 额外手段：即便目标 so 没把符号导出到 .dynsym（静态链接 BoringSSL），
@@ -572,6 +587,136 @@ static int try_inline_hook_global(void) {
             }
             g_hooks[i].hooked = 1;
             LOGI("inline-hooked (global): %s @ %p", g_hooks[i].name, addr);
+        }
+    }
+    return hooked;
+}
+
+/* ====================================================================
+ *  ★★★ 符号实体 inline hook（补齐 GOT hook 的盲区）
+ *
+ *  实测解析番茄的 so 得出符号分布：
+ *    SSL_CTX_set_custom_verify    -> libttboringssl.so  @0x49dac   (DEFINED, 12B)
+ *    SSL_set_verify               -> libttboringssl.so  @0x507dc   (DEFINED, 24B)
+ *    SSL_CTX_set_verify           -> libttboringssl.so  @0x50810   (DEFINED, 12B)
+ *    SSL_get_verify_result        -> libttboringssl.so  @0x50834   (DEFINED, 36B)
+ *    X509_verify_cert             -> libttcrypto.so     @0xdab60   (DEFINED, 2752B)
+ *    X509_STORE_CTX_get_error     -> libttcrypto.so     @0xdbe78   (DEFINED, 8B)
+ *    Cronet_CertVerify_DoVerifyV2 -> libsscronet.so     @0x27a30c  (DEFINED, 16B)
+ *    libsscronet.so 里的 SSL_CTX_set_custom_verify 是 UNDEF -> 运行时链接到 libttboringssl
+ *
+ *  结论：必须对这些 so 里的【函数实体】做 inline hook —— 内部调用不走 GOT。
+ * ==================================================================== */
+
+typedef struct {
+    const char *name;
+    const char *soname;
+    uintptr_t sym_addr;
+    size_t sym_size;
+} sym_hit_t;
+
+static sym_hit_t g_sym_hits[64];
+static int g_sym_hit_count = 0;
+
+static int collect_symbols_in_so(const char *soname, uintptr_t base,
+                                 const void *dyn, size_t dyn_size) {
+    const uint64_t *d = (const uint64_t *) dyn;
+    if (!d) return 0;
+
+    uint64_t symtab = 0, strtab = 0, strsz = 0;
+    int cnt = (int) (dyn_size / 16);
+    for (int i = 0; i < cnt; i++) {
+        uint64_t tag = d[i * 2], val = d[i * 2 + 1];
+        if (tag == DT_NULL_) break;
+        if (tag == DT_SYMTAB_) symtab = val;
+        else if (tag == DT_STRTAB_) strtab = val;
+        else if (tag == DT_STRSZ_) strsz = val;
+    }
+    if (!symtab || !strtab) return 0;
+    if (symtab < base) symtab += base;
+    if (strtab < base) strtab += base;
+
+    int found = 0;
+    for (int k = 0; k < 40000; k++) {
+        uint8_t *sym = (uint8_t *) (symtab + (uint64_t) k * 24);
+        uint32_t st_name = *(uint32_t *) (sym);
+        uint16_t st_shndx = *(uint16_t *) (sym + 6);
+        uint64_t st_value = *(uint64_t *) (sym + 8);
+        uint64_t st_size = *(uint64_t *) (sym + 16);
+
+        if (st_name == 0 && st_value == 0 && st_shndx == 0) {
+            if (k > 0) break;
+            continue;
+        }
+        if (st_name == 0) continue;
+        if (strsz && (uint64_t) st_name >= strsz) continue;
+        const char *nm = (const char *) (strtab + st_name);
+        if (!nm || !*nm) continue;
+
+        for (int h = 0; h < g_hook_count; h++) {
+            if (strcmp(nm, g_hooks[h].name) != 0) continue;
+            if (st_shndx == 0 || st_value == 0) continue;
+            if (g_sym_hit_count >= 64) return found;
+
+            int dup = 0;
+            for (int q = 0; q < g_sym_hit_count; q++) {
+                if (g_sym_hits[q].sym_addr == base + st_value) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup) break;
+
+            sym_hit_t *hit = &g_sym_hits[g_sym_hit_count++];
+            hit->name = nm;
+            hit->soname = soname;
+            hit->sym_addr = base + st_value;
+            hit->sym_size = (size_t) st_size;
+            LOGI("SYM: %s @ %s+0x%lx -> %p (size=%lu)",
+                 nm, soname ? soname : "?", (unsigned long) st_value,
+                 (void *) hit->sym_addr, (unsigned long) st_size);
+            found++;
+            break;
+        }
+    }
+    return found;
+}
+
+static int inline_hook_collected(void) {
+    int hooked = 0;
+    for (int i = 0; i < g_sym_hit_count; i++) {
+        sym_hit_t *hit = &g_sym_hits[i];
+        for (int h = 0; h < g_hook_count; h++) {
+            if (strcmp(hit->name, g_hooks[h].name) != 0) continue;
+
+            int dup = 0;
+            for (int k = 0; k < g_inline_count; k++) {
+                if (g_inline[k].target == (void *) hit->sym_addr) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup) break;
+            if (g_inline_count >= 16) break;
+
+            if (g_hooks[h].original == NULL) {
+                g_hooks[h].original = (void *) hit->sym_addr;
+            }
+
+            inline_hook_t *ih = &g_inline[g_inline_count];
+            ih->target = (void *) hit->sym_addr;
+            ih->replacement = g_hooks[h].replacement;
+            memcpy(ih->saved, ih->target, 16);
+            if (write_abs_jump(ih->target, g_hooks[h].replacement) == 0) {
+                ih->installed = 1;
+                g_inline_count++;
+                hooked++;
+                g_hooks[h].hooked = 1;
+                LOGI("** inline-hooked (so entity): %s @ %p", hit->name, ih->target);
+            } else {
+                LOGE("inline hook FAILED: %s @ %p", hit->name, ih->target);
+            }
+            break;
         }
     }
     return hooked;
@@ -699,7 +844,8 @@ Java_com_sslkit_native_1layer_NativeHookInstaller_nativeInstall(JNIEnv *env, jcl
 
     register_hooks();
     dl_iterate_phdr(phdr_cb, NULL);
-    int inline_n = try_inline_hook_global();
+    int inline_n = inline_hook_collected();
+    inline_n += try_inline_hook_global();
 
     int total = 0;
     for (int i = 0; i < g_hook_count; i++) {
@@ -716,6 +862,7 @@ Java_com_sslkit_native_1layer_NativeHookInstaller_nativeRescan(JNIEnv *env, jcla
     pthread_mutex_lock(&g_lock);
     register_hooks();
     dl_iterate_phdr(phdr_cb, NULL);
+    inline_hook_collected();
     try_inline_hook_global();
     int total = 0;
     for (int i = 0; i < g_hook_count; i++) {
@@ -748,5 +895,6 @@ static void sslkit_ctor(void) {
     LOGI("libsslkit.so loaded, auto-installing hooks");
     register_hooks();
     dl_iterate_phdr(phdr_cb, NULL);
+    inline_hook_collected();
     try_inline_hook_global();
 }
