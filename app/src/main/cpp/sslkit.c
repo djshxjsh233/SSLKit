@@ -260,6 +260,7 @@ static bool sslkit_Cronet_EngineParams_public_key_pins_add(void *params, void *p
 static int g_inline_enabled = 0;
 
 /* 前向声明 */
+static uint32_t gnu_hash_symcount(uint64_t gnu_hash, uint64_t symtab);
 static int collect_symbols_in_so(const char *soname, uintptr_t base,
                                  const void *dyn, size_t dyn_size);
 static int inline_hook_collected(void);
@@ -457,6 +458,10 @@ static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
     }
     if (is_excluded(name)) return 0;
     if (already_hooked(name)) return 0;
+    /* ★ 只扫 App 私有目录的 so（/system /apex /vendor 的跳过，省时且避免误伤） */
+    if (name[0] == '/' && strncmp(name, "/data/", 6) != 0) {
+        return 0;
+    }
 
     /* 找 PT_DYNAMIC = 2 */
     for (int i = 0; i < info->dlpi_phnum; i++) {
@@ -501,6 +506,7 @@ static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
 int hook_so_by_dynamic(so_ctx_t *ctx);
 int hook_rela_entries(void *rela_addr, size_t n, uint64_t symtab, uint64_t strtab,
                       uint64_t base, so_ctx_t *ctx);
+static uint32_t gnu_hash_symcount(uint64_t gnu_hash, uint64_t symtab);
 static int collect_symbols_in_so(const char *soname, uintptr_t base,
                                  const void *dyn, size_t dyn_size);
 static int inline_hook_collected(void);
@@ -643,6 +649,54 @@ typedef struct {
 static sym_hit_t g_sym_hits[64];
 static int g_sym_hit_count = 0;
 
+
+/*
+ * 用 DT_GNU_HASH 精确计算动态符号总数。
+ *
+ * 结构：
+ *   nbuckets(u32), symoffset(u32), bloom_size(u32), bloom_shift(u32)
+ *   bloom[bloom_size] (u64)
+ *   buckets[nbuckets] (u32)
+ *   chain[]           (u32)  -- 每个 bucket 链上的 (hash|1) 序列
+ *
+ * 最大符号索引 = symoffset + 最后一个 bucket 链长 - 1
+ */
+static uint32_t gnu_hash_symcount(uint64_t gnu_hash, uint64_t symtab) {
+    if (!gnu_hash || !symtab) return 0;
+    const uint32_t *h = (const uint32_t *) gnu_hash;
+    uint32_t nbuckets   = h[0];
+    uint32_t symoffset  = h[1];
+    uint32_t bloom_size = h[2];
+    if (nbuckets == 0 || bloom_size == 0 || nbuckets > 100000 || bloom_size > 100000) {
+        return 0;
+    }
+    const uint64_t *bloom = (const uint64_t *) (h + 4);
+    const uint32_t *buckets = (const uint32_t *) (bloom + bloom_size);
+    const uint32_t *chain = buckets + nbuckets;
+
+    /* 找最大 bucket 值 */
+    uint32_t max_sym = 0;
+    for (uint32_t i = 0; i < nbuckets; i++) {
+        if (buckets[i] > max_sym) max_sym = buckets[i];
+    }
+    if (max_sym < symoffset) {
+        return symoffset ? symoffset : 1;
+    }
+    /* 从 max_sym 沿 chain 走到链尾（最低位 = 1 表示结束） */
+    uint32_t idx = max_sym - symoffset;
+    uint32_t guard = 0;
+    while (guard++ < 200000) {
+        uint32_t v = chain[idx];
+        if (v & 1u) {
+            break;
+        }
+        idx++;
+    }
+    uint32_t count = symoffset + idx + 1;
+    if (count > 200000) return 0;
+    return count;
+}
+
 static int collect_symbols_in_so(const char *soname, uintptr_t base,
                                  const void *dyn, size_t dyn_size) {
     const uint64_t *d = (const uint64_t *) dyn;
@@ -669,15 +723,27 @@ static int collect_symbols_in_so(const char *soname, uintptr_t base,
     if (gnu_hash && gnu_hash < base) gnu_hash += base;
 
     /* ★ 用 DT_HASH 的 nchain 精确界定符号数量（最可靠） */
-    uint32_t nsym_limit = 40000;
+    /*
+     * ★ 符号数量必须【精确】确定，不能猜 —— 猜会在越界读时触发
+     *   SIGSEGV/SEGV_ACCERR（实测 libbinder.so 直接崩）。
+     *
+     * 优先 DT_HASH（SYSV hash）的 nchain：精确。
+     * 其次 DT_GNU_HASH：需要解析 bucket/chain 才能算 symcount。
+     * 两者都没有 -> 放弃（安全第一，GOT hook 已够用）。
+     */
+    uint32_t nsym_limit = 0;
     if (hash) {
-        uint32_t nchain = *(uint32_t *) (hash + 4);   /* hash[1] = nchain */
+        uint32_t nchain = *(uint32_t *) (hash + 4);
         if (nchain > 0 && nchain < 200000) {
             nsym_limit = nchain;
         }
-    } else if (gnu_hash && strsz) {
-        /* GNU hash 没直接给 nchain，用保守上限 */
-        nsym_limit = 40000;
+    } else if (gnu_hash) {
+        nsym_limit = gnu_hash_symcount(gnu_hash, symtab);
+    }
+    if (nsym_limit == 0) {
+        LOGI("  [dynsym] %s: no DT_HASH/DT_GNU_HASH -> skip symbol scan",
+             soname ? soname : "?");
+        return 0;   /* ★ 安全退出，绝不越界 */
     }
     LOGI("  [dynsym] %s: symtab=%p strtab=%p strsz=%lu hash=%p limit=%u",
          soname ? soname : "?", (void *) symtab, (void *) strtab,
