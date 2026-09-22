@@ -17,8 +17,15 @@ public final class Config {
     public static boolean L3_DART = true;
     /** L4: WebView / H5 层 */
     public static boolean L4_WEBVIEW = true;
-    /** L5: 反检测层（代理 / VPN 伪装） */
-    public static boolean L5_ANTIDETECT = true;
+    /**
+     * L5: 反检测层（代理 / VPN 伪装）。
+     *
+     * ★ 默认关闭（实测教训）：
+     *   VPN 抓包模式下 App 的流量【本来就必须】走代理。
+     *   把代理伪装成"无代理"会让 App 直连 → 绕过抓包 → 抓不到数据。
+     *   反检测只适用于"App 检测到代理就拒连"的场景，需用户显式开启。
+     */
+    public static boolean L5_ANTIDETECT = false;
 
     // ---- 细项开关 ----
     /** 全量类扫描（FULL 更通用但更慢；FAST 只 hook 已知类名） */
@@ -58,6 +65,33 @@ public final class Config {
             "libdmabufheap", "libhardware", "/vendor/", "libsslkit",
             "libc.so", "libm.so", "libdl.so", "libart", "libnativehelper"
     };
+
+    /**
+     * 从模块的远程 SharedPreferences 读用户配置（模块界面里改的开关）。
+     * LSPosed 的 getRemotePreferences(name) 可跨进程读模块自己的 prefs。
+     */
+    public static void loadFromPrefs(Object module) {
+        try {
+            android.content.SharedPreferences sp = null;
+            if (module instanceof io.github.libxposed.api.XposedInterfaceWrapper) {
+                sp = ((io.github.libxposed.api.XposedInterfaceWrapper) module)
+                        .getRemotePreferences("sslkit_config");
+            }
+            if (sp == null) {
+                return;
+            }
+            L1_JAVA = sp.getBoolean("l1", L1_JAVA);
+            L2_NATIVE = sp.getBoolean("l2", L2_NATIVE);
+            L3_DART = sp.getBoolean("l3", L3_DART);
+            L4_WEBVIEW = sp.getBoolean("l4", L4_WEBVIEW);
+            L5_ANTIDETECT = sp.getBoolean("l5", L5_ANTIDETECT);
+            FULL_CLASS_SCAN = sp.getBoolean("scan", FULL_CLASS_SCAN);
+            CRONET_KILL = sp.getBoolean("cronet", CRONET_KILL);
+            OKHTTP_OBFUSCATED = sp.getBoolean("okobf", OKHTTP_OBFUSCATED);
+            VERBOSE = sp.getBoolean("verbose", VERBOSE);
+        } catch (Throwable ignored) {
+        }
+    }
 
     private Config() {
     }

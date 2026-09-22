@@ -43,6 +43,7 @@ public class HookOrchestrator {
 
     public void run() {
         long t0 = System.currentTimeMillis();
+        Config.loadFromPrefs(module);
         HookLogger.reset(packageName);
         module.info("[SSLKit] ===== start hook: " + packageName + " =====");
 
