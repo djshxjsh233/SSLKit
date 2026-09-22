@@ -259,7 +259,9 @@ static bool sslkit_Cronet_EngineParams_public_key_pins_add(void *params, void *p
 
 /* ★ 全局开关：inline hook 在部分设备/App 上会因 SELinux 拒绝 mprotect(RWX)
  * 触发 SIGSEGV(SEGV_ACCERR)，默认关闭，由 system property debug.sslkit.inline=1 开启 */
-static int g_inline_enabled = 0;   /* 受 system property 控制，默认关 */
+static int g_inline_enabled = 0;
+/* 重入保护（phdr_cb / watchdog / inline_hook_collected 共用一个锁标志） */
+static volatile int g_in_dlopen_hook = 0;   /* 受 system property 控制，默认关 */
 
 /* 前向声明 */
 static uint32_t gnu_hash_symcount(uint64_t gnu_hash, uint64_t symtab);
@@ -574,8 +576,23 @@ static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
         if (is_tls_so(name) && !is_no_inline_so(name)) {
             m = collect_symbols_in_so(name, info->dlpi_addr,
                                       (const void *) dyn_addr, (size_t) ph->p_memsz);
+            /*
+             * ★ 关键修复：收集到符号后【立刻】inline hook。
+             *   之前只在 constructor 和 watchdog 里调 inline_hook_collected()，
+             *   而构造时 so 还没加载（SYM 收集不到），watchdog 又默认关闭 ->
+             *   符号收集了却从来没被 hook。
+             */
+            if (m > 0 && g_inline_enabled && !g_in_dlopen_hook) {
+                g_in_dlopen_hook = 1;
+                inline_hook_collected();
+                g_in_dlopen_hook = 0;
+            }
         } else if (is_no_inline_so(name)) {
-            LOGI("★ skip inline-hook (self-integrity checked): %s", name);
+            static int s_skip_logged = 0;
+            if (s_skip_logged < 3) {
+                LOGI("★ skip inline-hook (self-integrity checked): %s", name);
+                s_skip_logged++;
+            }
         }
         /* 非白名单 so：只打一次日志说明跳过 */
         else {
@@ -1206,7 +1223,7 @@ typedef void *(*android_dlopen_ext_t)(const char *, int, const void *);
 
 static dlopen_t g_orig_dlopen = NULL;
 static android_dlopen_ext_t g_orig_android_dlopen_ext = NULL;
-static volatile int g_in_dlopen_hook = 0;
+
 
 /* 重新扫描并 inline hook（dlopen 后调用） */
 static void rescan_and_hook(void) {
