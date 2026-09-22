@@ -750,6 +750,7 @@ static int collect_symbols_in_so(const char *soname, uintptr_t base,
          (unsigned long) strsz, (void *) hash, nsym_limit);
 
     int found = 0;
+    int dumped = 0;
     /* 先把 strtab 边界算出来，防止越界读 */
     uint64_t str_lo = strtab;
     uint64_t str_hi = strsz ? (strtab + strsz) : (strtab + 0x100000);
@@ -767,6 +768,13 @@ static int collect_symbols_in_so(const char *soname, uintptr_t base,
         if (st_shndx == 0 || st_value == 0) continue;
         const char *nm = (const char *) (strtab + st_name);
         if (!nm || !*nm) continue;
+
+        /* ★ 诊断：dump 前 15 个符号名，用于验证 symtab/strtab 地址是否正确 */
+        if (dumped < 15) {
+            LOGI("    sym[%u] name=\"%s\" val=0x%lx shndx=%u",
+                 k, nm, (unsigned long) st_value, (unsigned) st_shndx);
+            dumped++;
+        }
 
         for (int h = 0; h < g_hook_count; h++) {
             if (strcmp(nm, g_hooks[h].name) != 0) continue;
@@ -945,6 +953,108 @@ int hook_rela_entries(void *rela_addr, size_t n, uint64_t symtab, uint64_t strta
     return hooked;
 }
 
+
+/* ====================================================================
+ *  ★★ dlopen 拦截 —— 解决 "hook 太晚" 的问题
+ *
+ *  网络 so（libsscronet / libttboringssl / libquick）是运行时 dlopen 进来的。
+ *  如果在 onPackageReady（App 启动 2 秒后）才扫，它们的 SSL_CTX 早就建好了，
+ *  SSL_CTX_set_custom_verify 的回调也注册完了 —— 再 hook 函数头也没用。
+ *
+ *  解法：拦截 libdl.so / libc.so 的 dlopen / android_dlopen_ext / dlopen_ext，
+ *        每次 so 加载完成【立刻】跑一次全量扫描 + inline hook。
+ * ==================================================================== */
+
+typedef void *(*dlopen_t)(const char *, int);
+typedef void *(*android_dlopen_ext_t)(const char *, int, const void *);
+
+static dlopen_t g_orig_dlopen = NULL;
+static android_dlopen_ext_t g_orig_android_dlopen_ext = NULL;
+static volatile int g_in_dlopen_hook = 0;
+
+/* 重新扫描并 inline hook（dlopen 后调用） */
+static void rescan_and_hook(void) {
+    if (g_in_dlopen_hook) return;      /* 防重入 */
+    g_in_dlopen_hook = 1;
+    dl_iterate_phdr(phdr_cb, NULL);
+    inline_hook_collected();
+    try_inline_hook_global();
+    g_in_dlopen_hook = 0;
+}
+
+static void *my_dlopen(const char *filename, int flags) {
+    if (!g_orig_dlopen) {
+        return NULL;
+    }
+    void *h = g_orig_dlopen(filename, flags);
+    if (h) {
+        LOGI("dlopen captured: %s -> %p", filename ? filename : "?", h);
+        rescan_and_hook();
+    }
+    return h;
+}
+
+static void *my_android_dlopen_ext(const char *filename, int flags, const void *info) {
+    if (!g_orig_android_dlopen_ext) {
+        return NULL;
+    }
+    void *h = g_orig_android_dlopen_ext(filename, flags, info);
+    if (h) {
+        LOGI("android_dlopen_ext captured: %s -> %p", filename ? filename : "?", h);
+        rescan_and_hook();
+    }
+    return h;
+}
+
+/* 在 linker 里 inline hook dlopen 系列（用 dlsym 拿真实地址） */
+static void install_dlopen_hooks(void) {
+    void *h_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
+    if (h_dlopen && !g_orig_dlopen) {
+        LOGI("hooking dlopen @ %p", h_dlopen);
+        g_orig_dlopen = (dlopen_t) h_dlopen;
+        if (write_abs_jump(h_dlopen, (void *) my_dlopen) == 0) {
+            LOGI("** inline-hooked: dlopen");
+        } else {
+            g_orig_dlopen = NULL;
+        }
+    }
+    void *h_ade = dlsym(RTLD_DEFAULT, "android_dlopen_ext");
+    if (h_ade && !g_orig_android_dlopen_ext) {
+        LOGI("hooking android_dlopen_ext @ %p", h_ade);
+        g_orig_android_dlopen_ext = (android_dlopen_ext_t) h_ade;
+        if (write_abs_jump(h_ade, (void *) my_android_dlopen_ext) == 0) {
+            LOGI("** inline-hooked: android_dlopen_ext");
+        } else {
+            g_orig_android_dlopen_ext = NULL;
+        }
+    }
+}
+
+/* 启动一个后台线程，持续扫描（兜底 dlopen 拦截失效的情况） */
+static void *watchdog_thread(void *arg) {
+    (void) arg;
+    int last_total = -1;
+    for (int i = 0; i < 300; i++) {          /* 300 x 200ms = 60s */
+        usleep(200 * 1000);
+        if (g_in_dlopen_hook) continue;
+        g_in_dlopen_hook = 1;
+        int before = g_sym_hit_count;
+        dl_iterate_phdr(phdr_cb, NULL);
+        inline_hook_collected();
+        try_inline_hook_global();
+        int total = g_inline_count;
+        g_in_dlopen_hook = 0;
+        if (total != last_total) {
+            LOGI("[watchdog] so scan pass %d: new_syms=%d total_inline=%d",
+                 i, g_sym_hit_count - before, total);
+            last_total = total;
+        }
+        /* 全部 9 个目标都 hook 上了就继续跑，后面可能还有新 so */
+    }
+    LOGI("[watchdog] exit");
+    return NULL;
+}
+
 /* ====================================================================
  *  JNI 入口
  * ==================================================================== */
@@ -1024,4 +1134,14 @@ static void sslkit_ctor(void) {
     dl_iterate_phdr(phdr_cb, NULL);
     inline_hook_collected();
     try_inline_hook_global();
+
+    /* ★ 拦截 dlopen，新 so 加载后立刻 hook */
+    install_dlopen_hooks();
+
+    /* ★ watchdog 线程兜底（dlopen 拦截可能被 linker 内部路径绕过） */
+    pthread_t t;
+    if (pthread_create(&t, NULL, watchdog_thread, NULL) == 0) {
+        pthread_detach(t);
+        LOGI("[watchdog] started (300 x 200ms)");
+    }
 }
