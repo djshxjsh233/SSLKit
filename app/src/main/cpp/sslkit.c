@@ -484,6 +484,99 @@ int hook_so_by_dynamic(so_ctx_t *ctx);
 int hook_rela_entries(void *rela_addr, size_t n, uint64_t symtab, uint64_t strtab,
                       uint64_t base, so_ctx_t *ctx);
 
+/*
+ * ★ 额外手段：即便目标 so 没把符号导出到 .dynsym（静态链接 BoringSSL），
+ *   我们还可以直接按【exported symbol 名】dlsym 拿到函数地址，
+ *   然后做 inline hook（首指令替换为跳转到我们的实现）。
+ *
+ *   这对 libsscronet.so 这种"内部自带 BoringSSL、但把 SSL_* 作为导出符号暴露"的情况有效。
+ */
+extern void *dlsym(void *handle, const char *symbol);
+#include <dlfcn.h>
+
+/* 最小 inline hook：把目标函数头 16 字节替换为绝对跳转 */
+typedef struct {
+    void *target;
+    void *replacement;
+    unsigned char saved[16];
+    int installed;
+    int patched;      /* 是否已 patch 到 stub */
+    unsigned char *stub; /* 跳板：保存原指令 + 跳回 */
+} inline_hook_t;
+
+static inline_hook_t g_inline[16];
+static int g_inline_count = 0;
+
+/* 在目标地址写入绝对跳转：ldr x16,#8; br x16; .quad dest */
+static int write_abs_jump(void *target, void *dest) {
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t pg = (uintptr_t) target & ~(uintptr_t)(page - 1);
+    if (mprotect((void *) pg, (size_t) page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return -1;
+    }
+    unsigned char code[16];
+    /* ldr x16, #8   => 0x58000050 (little endian) */
+    code[0] = 0x50; code[1] = 0x00; code[2] = 0x00; code[3] = 0x58;
+    /* br x16        => 0xD61F0200 */
+    code[4] = 0x00; code[5] = 0x02; code[6] = 0x1F; code[7] = 0xD6;
+    /* .quad dest */
+    uint64_t d = (uint64_t) dest;
+    for (int i = 0; i < 8; i++) {
+        code[8 + i] = (unsigned char)((d >> (i * 8)) & 0xff);
+    }
+    memcpy(target, code, 16);
+    __builtin___clear_cache((char *) target, (char *) target + 16);
+    mprotect((void *) pg, (size_t) page * 2, PROT_READ | PROT_EXEC);
+    return 0;
+}
+
+/*
+ * 尝试对所有已加载 so（含 dlopen 进来的）用 dlsym 找目标符号并 inline hook。
+ * 注意：dlsym(RTLD_DEFAULT) 只找"全局可见"符号。
+ *       对没导出的内部符号无能为力（那种只能靠 GOT hook）。
+ */
+static int try_inline_hook_global(void) {
+    int hooked = 0;
+    for (int i = 0; i < g_hook_count; i++) {
+        if (g_hooks[i].hooked && g_hooks[i].original != NULL) {
+            /* GOT 已经拦到了，跳过 */
+        }
+        void *addr = dlsym(RTLD_DEFAULT, g_hooks[i].name);
+        if (!addr) {
+            continue;
+        }
+        /* 检查是否已经 inline hook 过 */
+        int found = 0;
+        for (int k = 0; k < g_inline_count; k++) {
+            if (g_inline[k].target == addr) {
+                found = 1;
+                break;
+            }
+        }
+        if (found) {
+            continue;
+        }
+        if (g_inline_count >= 16) {
+            break;
+        }
+        inline_hook_t *h = &g_inline[g_inline_count];
+        h->target = addr;
+        h->replacement = g_hooks[i].replacement;
+        memcpy(h->saved, addr, 16);
+        if (write_abs_jump(addr, g_hooks[i].replacement) == 0) {
+            h->installed = 1;
+            g_inline_count++;
+            hooked++;
+            if (g_hooks[i].original == NULL) {
+                g_hooks[i].original = addr;
+            }
+            g_hooks[i].hooked = 1;
+            LOGI("inline-hooked (global): %s @ %p", g_hooks[i].name, addr);
+        }
+    }
+    return hooked;
+}
+
 int hook_so_by_dynamic(so_ctx_t *ctx) {
     const uint64_t *dyn = (const uint64_t *) ctx->dyn;
     if (!dyn) return 0;
@@ -606,12 +699,13 @@ Java_com_sslkit_native_1layer_NativeHookInstaller_nativeInstall(JNIEnv *env, jcl
 
     register_hooks();
     dl_iterate_phdr(phdr_cb, NULL);
+    int inline_n = try_inline_hook_global();
 
     int total = 0;
     for (int i = 0; i < g_hook_count; i++) {
         if (g_hooks[i].hooked) total++;
     }
-    LOGI("native hook installed: %d symbols hooked", total);
+    LOGI("native hook installed: %d symbols hooked (%d via inline)", total, inline_n);
     pthread_mutex_unlock(&g_lock);
     return total;
 }
@@ -622,6 +716,7 @@ Java_com_sslkit_native_1layer_NativeHookInstaller_nativeRescan(JNIEnv *env, jcla
     pthread_mutex_lock(&g_lock);
     register_hooks();
     dl_iterate_phdr(phdr_cb, NULL);
+    try_inline_hook_global();
     int total = 0;
     for (int i = 0; i < g_hook_count; i++) {
         if (g_hooks[i].hooked) total++;
@@ -653,4 +748,5 @@ static void sslkit_ctor(void) {
     LOGI("libsslkit.so loaded, auto-installing hooks");
     register_hooks();
     dl_iterate_phdr(phdr_cb, NULL);
+    try_inline_hook_global();
 }
