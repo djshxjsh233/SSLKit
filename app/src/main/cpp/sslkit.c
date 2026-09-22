@@ -329,14 +329,61 @@ typedef struct {
     int hooked_count;
 } so_ctx_t;
 
+/*
+ * ★★ 白名单（比黑名单更可靠）
+ *
+ * 教训：全量扫描所有 so 的 .dynsym + inline hook 风险极高：
+ *   - libbytehook / libshadowhook 等第三方 hook 框架会和我们打架 -> 崩
+ *   - 各种加固/混淆库内存布局特殊 -> 符号表遍历可能越界
+ *
+ * 只有这些"确实做 TLS 校验"的库才值得 hook。
+ * 用户可通过 so 名关键词扩展（见 sslkit_extra_so）。
+ */
+static const char *g_tls_so_whitelist[] = {
+    /* AOSP / 标准 */
+    "libssl.so", "libcrypto.so", "libconscrypt",
+    /* BoringSSL 系（字节 / Google） */
+    "libttboringssl", "libttcrypto", "libcronet", "libsscronet",
+    "libttcronet", "libquic", "libboring",
+    /* 通用第三方 */
+    "libmbedtls", "libwolfssl", "libbearssl", "libnss",
+    /* Flutter / Dart */
+    "libflutter", "libdart", "libapp.so",
+    /* 常见自研网络库（可扩展） */
+    "libquick", "libnetwork", "libhttpdns", "libmars",
+    NULL
+};
+
+static int is_tls_so(const char *name) {
+    if (!name) return 0;
+    for (int i = 0; g_tls_so_whitelist[i]; i++) {
+        if (strcasestr(name, g_tls_so_whitelist[i])) return 1;
+    }
+    return 0;
+}
+
 static int is_excluded(const char *name) {
     if (!name) return 1;
     static const char *excl[] = {
+        /* 渲染/图形：hook 会 SIGABRT */
         "vulkan", "adreno", "mali", "gralloc", "libegl", "libgles",
         "libhwui", "libgui", "libui", "libllvm", "librs", "libgsl",
-        "libdmabufheap", "libhardware", "/vendor/", "libsslkit",
+        "libdmabufheap", "libhardware", "/vendor/",
+        /* 我们自己 */
+        "libsslkit",
+        /* 系统基础库：改它们必然崩 */
         "libc.so", "libm.so", "libdl.so", "libart", "libnativehelper",
-        "liblog.so", "libz.so", "libutils.so", NULL
+        "liblog.so", "libz.so", "libutils.so", "libbase.so",
+        "libbinder", "libcutils", "libsync", "libhidl",
+        /* ★ 第三方 hook 框架：和我们的 inline hook 会互相打架 -> 崩 */
+        "libbytehook", "libshadowhook", "libhook", "libsandhook",
+        "libdobby", "libwhale", "libxhook", "libbhook", "libpine",
+        "libsubstrate", "libepic", "libyuki",
+        /* 其它框架/运行时：符号表遍历有风险 */
+        "libflipped", "libnpth", "libgodzilla", "libsysoptimizer",
+        "libmannorarmor", "libmetasec", "libnslinker", "libpreload",
+        "libcollect_hook", "libaliyunaf", "libEncryptor",
+        NULL
     };
     for (int i = 0; excl[i]; i++) {
         if (strcasestr(name, excl[i])) return 1;
@@ -497,9 +544,20 @@ static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
         extern int hook_so_by_dynamic(so_ctx_t *ctx);
         int n = hook_so_by_dynamic(&ctx);
 
-        /* 方式 B：★ 收集该 so 里目标符号的实体地址（供 inline hook） */
-        int m = collect_symbols_in_so(name, info->dlpi_addr,
+        /* 方式 B：★ 收集符号实体（只对 TLS 白名单 so 做 —— 全扫风险高） */
+        int m = 0;
+        if (is_tls_so(name)) {
+            m = collect_symbols_in_so(name, info->dlpi_addr,
                                       (const void *) dyn_addr, (size_t) ph->p_memsz);
+        }
+        /* 非白名单 so：只打一次日志说明跳过 */
+        else {
+            static int s_logged_skip = 0;
+            if (s_logged_skip < 5) {
+                LOGI("skip symbol scan (not TLS-related): %s", name);
+                s_logged_skip++;
+            }
+        }
 
         if (n > 0 || m > 0) {
             LOGI("%s: GOT=%d, SYM=%d", name, n, m);
