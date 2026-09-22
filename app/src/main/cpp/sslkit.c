@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <errno.h>
 
 #define LOG_TAG "SSLKit-Native"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -254,6 +255,10 @@ static bool sslkit_Cronet_EngineParams_public_key_pins_add(void *params, void *p
  *  符号表
  * ==================================================================== */
 
+/* ★ 全局开关：inline hook 在部分设备/App 上会因 SELinux 拒绝 mprotect(RWX)
+ * 触发 SIGSEGV(SEGV_ACCERR)，默认关闭，由 system property debug.sslkit.inline=1 开启 */
+static int g_inline_enabled = 0;
+
 /* 前向声明 */
 static int collect_symbols_in_so(const char *soname, uintptr_t base,
                                  const void *dyn, size_t dyn_size);
@@ -412,10 +417,12 @@ static int hook_so(shdr_t *shdr, int shnum, so_ctx_t *ctx) {
 
                 /* 打开写权限 */
                 long page = sysconf(_SC_PAGESIZE);
-                uintptr_t pg = (uintptr_t) got & ~(page - 1);
-                if (mprotect((void *) pg, (size_t) page * 2,
+                uintptr_t pg = (uintptr_t) got & ~(uintptr_t)(page - 1);
+                uintptr_t gend2 = ((uintptr_t) got + sizeof(void*) - 1) & ~(uintptr_t)(page - 1);
+                size_t glen2 = (size_t)(gend2 - pg) + (size_t)page;
+                if (mprotect((void *) pg, glen2,
                              PROT_READ | PROT_WRITE) != 0) {
-                    LOGE("mprotect fail @%p", got);
+                    LOGE("mprotect fail @%p (errno=%d)", got, errno);
                     continue;
                 }
 
@@ -429,8 +436,7 @@ static int hook_so(shdr_t *shdr, int shnum, so_ctx_t *ctx) {
                      sname, ctx->name ? ctx->name : "?",
                      (void *) g_hooks[h].original, g_hooks[h].replacement);
 
-                /* 恢复只读（只读+可执行） */
-                mprotect((void *) pg, (size_t) page * 2, PROT_READ);
+                mprotect((void *) pg, glen2, PROT_READ);
                 break;
             }
         }
@@ -522,11 +528,26 @@ typedef struct {
 static inline_hook_t g_inline[16];
 static int g_inline_count = 0;
 
-/* 在目标地址写入绝对跳转：ldr x16,#8; br x16; .quad dest */
+/*
+ * 在目标地址写入绝对跳转：ldr x16,#8; br x16; .quad dest
+ *
+ * ★ 安全要点（闪退教训）：
+ *   - SELinux 在 targetSdk 高 的 App 上会拒绝 executable 内存的 mprotect
+ *   - 必须只改【覆盖 target 所需的最小页数】，不要盲改 2 页
+ *   - mprotect 失败要立刻返回，绝不能继续写
+ *   - 写完后恢复【原始权限】，不是盲目 PROT_READ
+ */
 static int write_abs_jump(void *target, void *dest) {
     long page = sysconf(_SC_PAGESIZE);
-    uintptr_t pg = (uintptr_t) target & ~(uintptr_t)(page - 1);
-    if (mprotect((void *) pg, (size_t) page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    uintptr_t start = (uintptr_t) target;
+    uintptr_t pg = start & ~(uintptr_t)(page - 1);
+    /* 只覆盖 target..target+16 所需的页 */
+    uintptr_t end = (start + 16 - 1) & ~(uintptr_t)(page - 1);
+    size_t len = (size_t) (end - pg) + (size_t) page;
+
+    if (mprotect((void *) pg, len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("mprotect(RWX) failed @%p len=%lu (errno=%d) -- skip inline hook",
+             target, (unsigned long) len, errno);
         return -1;
     }
     unsigned char code[16];
@@ -541,7 +562,8 @@ static int write_abs_jump(void *target, void *dest) {
     }
     memcpy(target, code, 16);
     __builtin___clear_cache((char *) target, (char *) target + 16);
-    mprotect((void *) pg, (size_t) page * 2, PROT_READ | PROT_EXEC);
+    /* 恢复只读+可执行 */
+    mprotect((void *) pg, len, PROT_READ | PROT_EXEC);
     return 0;
 }
 
@@ -551,6 +573,9 @@ static int write_abs_jump(void *target, void *dest) {
  *       对没导出的内部符号无能为力（那种只能靠 GOT hook）。
  */
 static int try_inline_hook_global(void) {
+    if (!g_inline_enabled) {
+        return 0;
+    }
     int hooked = 0;
     for (int i = 0; i < g_hook_count; i++) {
         if (g_hooks[i].hooked && g_hooks[i].original != NULL) {
@@ -707,6 +732,9 @@ static int collect_symbols_in_so(const char *soname, uintptr_t base,
 }
 
 static int inline_hook_collected(void) {
+    if (!g_inline_enabled) {
+        return 0;
+    }
     int hooked = 0;
     for (int i = 0; i < g_sym_hit_count; i++) {
         sym_hit_t *hit = &g_sym_hits[i];
@@ -831,9 +859,10 @@ int hook_rela_entries(void *rela_addr, size_t n, uint64_t symtab, uint64_t strta
 
             uintptr_t *got = (uintptr_t *) (base + r_offset);
             uintptr_t pg = (uintptr_t) got & ~(uintptr_t) (page - 1);
+            uintptr_t gend = ((uintptr_t) got + sizeof(void *) - 1) & ~(uintptr_t)(page - 1);
+            size_t glen = (size_t) (gend - pg) + (size_t) page;
 
-            if (mprotect((void *) pg, (size_t) page * 2,
-                         PROT_READ | PROT_WRITE) != 0) {
+            if (mprotect((void *) pg, glen, PROT_READ | PROT_WRITE) != 0) {
                 continue;
             }
             if (g_hooks[h].original == NULL) {
@@ -843,7 +872,7 @@ int hook_rela_entries(void *rela_addr, size_t n, uint64_t symtab, uint64_t strta
             g_hooks[h].hooked = 1;
             hooked++;
             LOGI("GOT hooked: %s (orig=%p)", sname, g_hooks[h].original);
-            mprotect((void *) pg, (size_t) page * 2, PROT_READ);
+            mprotect((void *) pg, glen, PROT_READ);
             break;
         }
     }
@@ -914,9 +943,17 @@ Java_com_sslkit_native_1layer_NativeHookInstaller_nativeVersion(JNIEnv *env, jcl
 }
 
 /* 构造函数：so 加载时自动 hook 一次 */
+/* 读 Java 传进来的开关（通过 __system_property_get） */
+extern int __system_property_get(const char *name, char *value);
+
 __attribute__((constructor))
 static void sslkit_ctor(void) {
-    LOGI("libsslkit.so loaded, auto-installing hooks");
+    char buf[8];
+    buf[0] = 0;
+    if (__system_property_get("debug.sslkit.inline", buf) > 0 && buf[0] == '1') {
+        g_inline_enabled = 1;
+    }
+    LOGI("libsslkit.so loaded, inline_hook=%s", g_inline_enabled ? "ON" : "OFF");
     register_hooks();
     dl_iterate_phdr(phdr_cb, NULL);
     inline_hook_collected();
