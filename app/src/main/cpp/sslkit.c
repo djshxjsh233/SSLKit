@@ -543,11 +543,22 @@ static int g_inline_count = 0;
  *   - mprotect 失败要立刻返回，绝不能继续写
  *   - 写完后恢复【原始权限】，不是盲目 PROT_READ
  */
+/*
+ * 写入绝对跳转。
+ *
+ * ★ 安全策略（多线程下的正确做法）：
+ *   1. 目标函数前 16 字节拆成【两条 8 字节写入】，
+ *      先用原子方式写第 2 个 8 字节（.quad dest 的高位部分不动），
+ *      再写第 1 个 8 字节（ldr+br 指令对）—— 保证任何时刻 CPU 取到的
+ *      要么是原指令，要么是完整跳转，不会取到半条指令。
+ *   2. aarch64 的 `ldr x16,#8; br x16; .quad` 共 16 字节，
+ *      其中 [0..7] 是指令（8 字节对齐读），[8..15] 是地址数据。
+ *      ARM64 指令是 4 字节定长，只要 8 字节原子写 [0..7] 即可安全。
+ */
 static int write_abs_jump(void *target, void *dest) {
     long page = sysconf(_SC_PAGESIZE);
     uintptr_t start = (uintptr_t) target;
     uintptr_t pg = start & ~(uintptr_t)(page - 1);
-    /* 只覆盖 target..target+16 所需的页 */
     uintptr_t end = (start + 16 - 1) & ~(uintptr_t)(page - 1);
     size_t len = (size_t) (end - pg) + (size_t) page;
 
@@ -556,19 +567,23 @@ static int write_abs_jump(void *target, void *dest) {
              target, (unsigned long) len, errno);
         return -1;
     }
+
+    /* 构造 16 字节跳转块 */
     unsigned char code[16];
-    /* ldr x16, #8   => 0x58000050 (little endian) */
-    code[0] = 0x50; code[1] = 0x00; code[2] = 0x00; code[3] = 0x58;
-    /* br x16        => 0xD61F0200 */
-    code[4] = 0x00; code[5] = 0x02; code[6] = 0x1F; code[7] = 0xD6;
-    /* .quad dest */
+    code[0] = 0x50; code[1] = 0x00; code[2] = 0x00; code[3] = 0x58;  /* ldr x16,#8 */
+    code[4] = 0x00; code[5] = 0x02; code[6] = 0x1F; code[7] = 0xD6;  /* br x16 */
     uint64_t d = (uint64_t) dest;
     for (int i = 0; i < 8; i++) {
         code[8 + i] = (unsigned char)((d >> (i * 8)) & 0xff);
     }
-    memcpy(target, code, 16);
+
+    /* ★ 顺序：先写数据块 [8..15]，再写指令块 [0..7]（原子 8 字节） */
+    __atomic_store_n((uint64_t *) ((uintptr_t) target + 8),
+                     *(uint64_t *) (code + 8), __ATOMIC_RELEASE);
+    __atomic_store_n((uint64_t *) (uintptr_t) target,
+                     *(uint64_t *) code, __ATOMIC_RELEASE);
+
     __builtin___clear_cache((char *) target, (char *) target + 16);
-    /* 恢复只读+可执行 */
     mprotect((void *) pg, len, PROT_READ | PROT_EXEC);
     return 0;
 }
@@ -982,71 +997,41 @@ static void rescan_and_hook(void) {
     g_in_dlopen_hook = 0;
 }
 
-static void *my_dlopen(const char *filename, int flags) {
-    if (!g_orig_dlopen) {
-        return NULL;
-    }
-    void *h = g_orig_dlopen(filename, flags);
-    if (h) {
-        LOGI("dlopen captured: %s -> %p", filename ? filename : "?", h);
-        rescan_and_hook();
-    }
-    return h;
-}
+/*
+ * ★ 注意：不要 hook dlopen / android_dlopen_ext！
+ *
+ * 它们是多线程高频热点函数，inline hook 改写首个指令块时，
+ * 其它线程可能正在执行该处的指令 -> SIGSEGV/SEGV_ACCERR（实测必崩）。
+ *
+ * 替代方案：watchdog 线程高频轮询 + JNI_OnLoad/Linker 完成回调。
+ */
 
-static void *my_android_dlopen_ext(const char *filename, int flags, const void *info) {
-    if (!g_orig_android_dlopen_ext) {
-        return NULL;
-    }
-    void *h = g_orig_android_dlopen_ext(filename, flags, info);
-    if (h) {
-        LOGI("android_dlopen_ext captured: %s -> %p", filename ? filename : "?", h);
-        rescan_and_hook();
-    }
-    return h;
-}
 
-/* 在 linker 里 inline hook dlopen 系列（用 dlsym 拿真实地址） */
 static void install_dlopen_hooks(void) {
-    void *h_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
-    if (h_dlopen && !g_orig_dlopen) {
-        LOGI("hooking dlopen @ %p", h_dlopen);
-        g_orig_dlopen = (dlopen_t) h_dlopen;
-        if (write_abs_jump(h_dlopen, (void *) my_dlopen) == 0) {
-            LOGI("** inline-hooked: dlopen");
-        } else {
-            g_orig_dlopen = NULL;
-        }
-    }
-    void *h_ade = dlsym(RTLD_DEFAULT, "android_dlopen_ext");
-    if (h_ade && !g_orig_android_dlopen_ext) {
-        LOGI("hooking android_dlopen_ext @ %p", h_ade);
-        g_orig_android_dlopen_ext = (android_dlopen_ext_t) h_ade;
-        if (write_abs_jump(h_ade, (void *) my_android_dlopen_ext) == 0) {
-            LOGI("** inline-hooked: android_dlopen_ext");
-        } else {
-            g_orig_android_dlopen_ext = NULL;
-        }
-    }
+    /* 刻意留空：见上方说明 */
 }
 
 /* 启动一个后台线程，持续扫描（兜底 dlopen 拦截失效的情况） */
 static void *watchdog_thread(void *arg) {
     (void) arg;
     int last_total = -1;
-    for (int i = 0; i < 300; i++) {          /* 300 x 200ms = 60s */
-        usleep(200 * 1000);
+    for (int i = 0; i < 1200; i++) {          /* 1200 x 50ms = 60s */
+        usleep(50 * 1000);
         if (g_in_dlopen_hook) continue;
+        if (!g_inline_enabled) continue;
         g_in_dlopen_hook = 1;
-        int before = g_sym_hit_count;
+        int before_syms = g_sym_hit_count;
+        int before_inline = g_inline_count;
         dl_iterate_phdr(phdr_cb, NULL);
-        inline_hook_collected();
-        try_inline_hook_global();
+        /* ★ 只有发现了新符号才做 inline hook（避免反复改写代码段） */
+        if (g_sym_hit_count > before_syms) {
+            inline_hook_collected();
+        }
         int total = g_inline_count;
         g_in_dlopen_hook = 0;
         if (total != last_total) {
-            LOGI("[watchdog] so scan pass %d: new_syms=%d total_inline=%d",
-                 i, g_sym_hit_count - before, total);
+            LOGI("[watchdog] pass %d: new_syms=%d total_inline=%d",
+                 i, g_sym_hit_count - before_syms, total);
             last_total = total;
         }
         /* 全部 9 个目标都 hook 上了就继续跑，后面可能还有新 so */
