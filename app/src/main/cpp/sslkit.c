@@ -976,9 +976,15 @@ static int inline_hook_collected(void) {
         for (int h = 0; h < g_hook_count; h++) {
             if (strcmp(hit->name, g_hooks[h].name) != 0) continue;
 
-            /* ★ 已被 GOT hook 过的符号跳过 inline（避免 original 指向被改写代码） */
-            if (g_hooks[h].hooked) break;
-
+            /*
+             * ★ 修正（实测教训）：
+             *   之前这里写 "if (g_hooks[h].hooked) break;" ——
+             *   GOT hook 先把 hooked 置 1，导致 inline hook 全部被跳过，
+             *   而 GOT 拦不到 so 内部调用 -> TLS 过不了。
+             *
+             *   GOT 与 inline 改的是【不同位置】（GOT 表 vs 函数实体），可以共存。
+             *   真正要防的是【同一符号被 inline hook 两次】。
+             */
             int dup = 0;
             for (int k = 0; k < g_inline_count; k++) {
                 if (g_inline[k].target == (void *) hit->sym_addr) {
@@ -994,13 +1000,13 @@ static int inline_hook_collected(void) {
             ih->replacement = g_hooks[h].replacement;
             memcpy(ih->saved, ih->target, 16);
 
-            /* ★ 先建跳板：original 必须指向跳板，不能指向被改写的 target
-             *   （否则 orig() 会再次跳进我们的 hook -> 无限递归 -> 卡死） */
             ih->trampoline = create_trampoline(ih->target, ih->saved);
             if (ih->trampoline == NULL) {
                 LOGE("trampoline failed for %s -> skip", hit->name);
                 break;
             }
+            /* ★ original 覆盖为 trampoline：无论之前是 GOT 原值还是 NULL，
+             *   统一指向跳板 —— 保证 replacement 里的 orig() 不会递归 */
             g_hooks[h].original = ih->trampoline;
 
             if (write_abs_jump(ih->target, g_hooks[h].replacement) == 0) {
