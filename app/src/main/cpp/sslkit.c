@@ -155,13 +155,15 @@ static int sslkit_custom_verify_cb(void *ssl, uint8_t *out_alert) {
 }
 
 static void sslkit_SSL_CTX_set_custom_verify(void *ctx, int mode, void *cb) {
-    __sync_fetch_and_add(&g_stat_custom_verify, 1);
-    LOGI("SSL_CTX_set_custom_verify called (mode=%d) -> replaced with always-OK", mode);
-    /* 重新调用原函数，但传入我们的回调 */
-    /* 原函数原型: void SSL_CTX_set_custom_verify(SSL_CTX*, int mode, cb) */
+    int n = __sync_fetch_and_add(&g_stat_custom_verify, 1);
+    /* 只在第一次和每 100 次打日志，避免刷爆 logcat 影响时序 */
+    if (n < 3 || (n % 100) == 0) {
+        LOGI("SSL_CTX_set_custom_verify called (mode=%d, n=%d) -> always-OK", mode, n + 1);
+    }
     typedef void (*fn_t)(void *, int, void *);
     fn_t orig = (fn_t) find_original("SSL_CTX_set_custom_verify");
     if (orig) {
+        /* 保留原 mode（改动 mode 可能影响握手流程），只替换回调 */
         orig(ctx, mode, (void *) sslkit_custom_verify_cb);
     }
 }
@@ -267,16 +269,30 @@ static int inline_hook_collected(void);
 static int write_abs_jump(void *target, void *dest);
 static int try_inline_hook_global(void);
 
+/*
+ * 目标符号表。
+ *
+ * ★ 最小必要原则（实测教训）：
+ *   不是 hook 越多越好。有些函数被 BoringSSL 用作【状态机判断】，
+ *   强制改返回值会让内部状态不一致 -> 连接卡死（现象：TLS 通了但数据不流动）。
+ *
+ *   - SSL_CTX_set_custom_verify : 只把回调换成 always-OK，不改协议状态 -> 安全
+ *   - SSL_set_verify / SSL_CTX_set_verify : 同理，只是设置 verify mode -> 安全
+ *   - Cronet_CertVerify_DoVerifyV2 : Cronet 校验总闸，返回成功 -> 安全
+ *   - Cronet_EngineParams_public_key_pins_add : 吞掉 pin -> 安全
+ *   - Cronet_VerifyResult_is_issued_by_known_root_set : 置 true -> 安全
+ *
+ *   ❌ 已移除（有副作用）：
+ *   - SSL_get_verify_result : 有的库用它做握手状态机判断，强制 0 -> 卡死
+ *   - X509_STORE_CTX_get_error : 同上，BoringSSL 内部依赖它做错误路径判断
+ *   - X509_verify_cert : 直接返回 1 会让 X509_STORE_CTX 内部状态不一致
+ */
 static void register_hooks(void) {
     int i = 0;
+
+    /* --- 安全：设置类 --- */
     g_hooks[i].name = "SSL_CTX_set_custom_verify";
     g_hooks[i++].replacement = (void *) sslkit_SSL_CTX_set_custom_verify;
-
-    g_hooks[i].name = "X509_verify_cert";
-    g_hooks[i++].replacement = (void *) sslkit_X509_verify_cert;
-
-    g_hooks[i].name = "SSL_get_verify_result";
-    g_hooks[i++].replacement = (void *) sslkit_SSL_get_verify_result;
 
     g_hooks[i].name = "SSL_set_verify";
     g_hooks[i++].replacement = (void *) sslkit_SSL_set_verify;
@@ -284,10 +300,7 @@ static void register_hooks(void) {
     g_hooks[i].name = "SSL_CTX_set_verify";
     g_hooks[i++].replacement = (void *) sslkit_SSL_CTX_set_verify;
 
-    g_hooks[i].name = "X509_STORE_CTX_get_error";
-    g_hooks[i++].replacement = (void *) sslkit_X509_STORE_CTX_get_error;
-
-    /* Cronet */
+    /* --- 安全：Cronet 专用 --- */
     g_hooks[i].name = "Cronet_CertVerify_DoVerifyV2";
     g_hooks[i++].replacement = (void *) sslkit_Cronet_CertVerify_DoVerifyV2;
 
@@ -298,7 +311,7 @@ static void register_hooks(void) {
     g_hooks[i++].replacement = (void *) sslkit_Cronet_EngineParams_public_key_pins_add;
 
     g_hook_count = i;
-    LOGI("registered %d target symbols", g_hook_count);
+    LOGI("registered %d target symbols (minimal set)", g_hook_count);
 }
 
 /* ====================================================================
